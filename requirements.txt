@@ -1,0 +1,12 @@
+matplotlib
+numpy
+pandas
+fpdf
+google-search-results   # สำหรับ serpapi.GoogleSearch
+openai
+pdfplumber
+requests
+beautifulsoup4
+streamlit
+pytesseract
+pillow
