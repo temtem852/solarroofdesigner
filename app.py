@@ -16,11 +16,20 @@ import pytesseract
 import re
 from PIL import Image, ImageFilter, ImageOps
 from io import BytesIO
+from dotenv import load_dotenv
+import os
 
-OPENAI_KEY = "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"
-openai.api_key = OPENAI_KEY
+load_dotenv()
 
-SERPAPI_KEY = "d372cb93c1f53bf1a94b225ed594171d04a4663fe7cb176ae8b77272250aff4b"
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+SERPAPI_KEY = os.getenv("SERPAPI_API_KEY")
+
+
+
+# ดึงค่า API key
+
+
+
 
 # ===== การตั้งค่าแอป =====
 st.set_page_config(page_title="Solar Rooftop Designer", page_icon="🔆", layout="wide")
