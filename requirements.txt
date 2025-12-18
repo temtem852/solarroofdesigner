@@ -1,12 +1,14 @@
-matplotlib
-numpy
-pandas
-fpdf
-google-search-results   # สำหรับ serpapi.GoogleSearch
-openai
-pdfplumber
-requests
-beautifulsoup4
-streamlit
-pytesseract
-pillow
+streamlit~=1.52.2
+openai~=2.13.0
+pandas~=2.3.3
+numpy~=2.3.5
+fpdf~=1.7.2
+pdfplumber~=0.11.8
+pytesseract~=0.3.13
+beautifulsoup4~=4.14.3
+requests~=2.32.5
+serpapi~=0.1.5
+matplotlib~=3.10.8
+Pillow~=12.0.0
+
+python-dotenv~=1.2.1
