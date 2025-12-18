@@ -12,3 +12,4 @@ matplotlib~=3.10.8
 Pillow~=12.0.0
 google-search-results
 python-dotenv~=1.2.1
+xlsxwriter
