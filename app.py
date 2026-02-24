@@ -1,539 +1,1448 @@
-# app.py
-# ===== Imports =====
-import matplotlib.pyplot as plt
+# =========================================================
+# Solar Rooftop Designer — All-in-One (Production Ready)
+# =========================================================
+
+import os, re, json
 import numpy as np
-import pandas as pd
-from fpdf import FPDF
 from serpapi import GoogleSearch
-import mimetypes
-import openai
-import pdfplumber
-import json
-import requests
-from bs4 import BeautifulSoup
+import google.generativeai as genai
+from fpdf import FPDF
 import streamlit as st
-import pytesseract
-import re
-from PIL import Image, ImageFilter, ImageOps
-from io import BytesIO
+import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
+from datetime import datetime
 from dotenv import load_dotenv
-import os
+
+
+import streamlit as st
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase import pdfmetrics
+from datetime import datetime
+import io
+
+
 
 load_dotenv()
 
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-SERPAPI_KEY = os.getenv("SERPAPI_API_KEY")
+SPREADSHEET_KEY = os.getenv("SPREADSHEET_KEY")
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE")
+
+LLM_PROVIDER = None
+
+if GEMINI_KEY:
+    LLM_PROVIDER = "gemini"
+elif OPENAI_KEY:
+    LLM_PROVIDER = "openai"
+
+
+# =========================================================
+# APP CONFIG
+# =========================================================
+st.set_page_config(
+    page_title="Solar Rooftop Designer",
+    page_icon="🔆",
+    layout="wide"
+)
+
+st.title(" Solar Rooftop Designer ")
+
+
+from fpdf import FPDF
+from fpdf.enums import XPos, YPos
+from datetime import datetime
 
 
 
-# ดึงค่า API key
+
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 
 
+# ต้องตรงกับชื่อ tab จริงใน Google Sheets
+TAB_KEYWORDS = {
+    "Solar_Panels": [
+        "panel", "solar panel", "pv module", "module",
+        "mono", "perc", "topcon", "bifacial", "vertex", "tiger"
+    ],
+    "Inverters": [
+        "inverter", "string inverter", "hybrid inverter",
+        "on-grid", "off-grid", "mppt", "sungrow", "growatt", "huawei"
+    ],
+    "Batteries": [
+        "battery", "lithium", "lifepo4", "storage", "bms"
+    ],
+    "Accessories": [
+        "mount", "rail", "clamp", "mc4",
+        "dc cable", "ac cable", "combiner"
+    ]
+}
 
-# ===== การตั้งค่าแอป =====
-st.set_page_config(page_title="Solar Rooftop Designer", page_icon="🔆", layout="wide")
-st.title(" Solar Rooftop Designer")
+DEFAULT_TAB = "Accessories"
+if "TH" not in pdfmetrics.getRegisteredFontNames():
+    pdfmetrics.registerFont(TTFont("TH", "THSarabunNew.ttf"))
+    pdfmetrics.registerFont(TTFont("TH-B", "THSarabunNew-Bold.ttf"))
 
-# ===== Utilities =====
-def irr(cashflows, guess: float = 0.1, max_iter: int = 100, tol: float = 1e-6) -> float:
-    """คำนวณ IRR จาก cashflows ด้วย Newton-Raphson"""
-    r = guess
-    for _ in range(max_iter):
-        f = sum(cf / ((1 + r) ** i) for i, cf in enumerate(cashflows))
-        df = sum(-i * cf / ((1 + r) ** (i + 1)) for i, cf in enumerate(cashflows))
-        if abs(df) < 1e-12: break
-        r_new = r - f / df
-        if abs(r_new - r) < tol: return r_new
-        r = r_new
-    return r
+# =========================================================
+# CONNECT GOOGLE SHEETS
+# =========================================================
 
-def serpapi_search(query: str, location: str = "Thailand", num: int = 10):
-    """ค้นหาด้วย SerpAPI"""
-    params = {"engine": "google", "q": query, "location": location, "num": num, "api_key": SERPAPI_KEY}
-    search = GoogleSearch(params)
-    results = search.get_dict()
-    return [{"title": item.get("title", ""), "snippet": item.get("snippet", ""), "link": item.get("link", "")}
-            for item in results.get("organic_results", [])]
+@st.cache_resource
+def connect_spreadsheet():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
 
-
-## ===== OCR Extract by Keyword =====
-def extract_specs_from_image_by_keyword(uploaded_file, keyword: str) -> dict:
-
-    def preprocess_image(img: Image.Image) -> Image.Image:
-        img = img.convert("L")
-        img = img.resize((int(img.width * 1.3), int(img.height * 1.3)), Image.LANCZOS)
-        img = img.filter(ImageFilter.MedianFilter(size=3))
-        img = ImageOps.autocontrast(img)
-        return img.point(lambda p: 255 if p > 150 else 0)
-
-    try:
-        raw = uploaded_file.read()
-        uploaded_file.seek(0)
-
-        img = Image.open(BytesIO(raw))
-
-        # ---- performance: crop เฉพาะส่วนกลาง ----
-        w, h = img.size
-        img = img.crop((0, int(h * 0.15), w, int(h * 0.65)))
-
-        pre = preprocess_image(img)
-
-        text = pytesseract.image_to_string(
-            pre,
-            lang="eng",
-            config="--psm 6 -c preserve_interword_spaces=1"
-        )
-
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        block = next(
-            ("\n".join(lines[i:i+15]) for i, ln in enumerate(lines) if keyword in ln),
-            ""
-        )
-
-        specs = {
-            "Pm":  r"(?:Maximum Power|Pmax).*?(\d{3,4})\s*W[pP]",
-            "Vmp": r"(?:Power Voltage|Vmp).*?(\d{2,3}\.\d{2})\s*V",
-            "Imp": r"(?:Power Current|Imp).*?(\d{2,3}\.\d{2})\s*A",
-            "Voc": r"(?:Open[- ]?circuit Voltage|Voc).*?(\d{2,3}\.\d{2})\s*V",
-            "Isc": r"(?:Short[- ]?circuit Current|Isc).*?(\d{2,3}\.\d{2})\s*A",
-        }
-
-        result = {}
-        for k, p in specs.items():
-            m = re.search(p, block)
-            if m:
-                try:
-                    result[k] = float(m.group(1))
-                except Exception:
-                    pass
-
-        return result
-
-    except Exception as e:
-        print("OCR spec extract error:", e)
-        return {}
-
-
-# ===== Auto Extract Text =====
-def auto_extract_text(source: str, timeout: int = 12) -> str:
-
-    text = ""
-    try:
-        is_url = source.startswith("http")
-        mime, _ = mimetypes.guess_type(source)
-
-        if is_url:
-            resp = requests.get(source, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code != 200:
-                return ""
-            data = resp.content
-        else:
-            data = None
-
-        if mime and "pdf" in mime:
-            pdf_src = BytesIO(data) if is_url else source
-            with pdfplumber.open(pdf_src) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += page_text + "\n"
-
-        elif mime and "image" in mime:
-            img = Image.open(BytesIO(data)) if is_url else Image.open(source)
-            pre = extract_specs_from_image_by_keyword(img, "")
-            text = pytesseract.image_to_string(pre, lang="eng")
-
-        else:
-            if is_url:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                text = soup.get_text(separator="\n")
-            else:
-                with open(source, "r", encoding="utf-8", errors="ignore") as f:
-                    text = f.read()
-
-    except Exception as e:
-        print("auto_extract_text error:", e)
-
-    return text.strip()
-
-
-# ===== Fetch Page Text =====
-def fetch_page_text(url: str, timeout: int = 12, max_chars: int = 30000) -> str:
-
-    try:
-        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200:
-            return ""
-
-        if "html" in resp.headers.get("Content-Type", "").lower() or resp.text.lstrip().startswith("<"):
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for tag in soup(["script", "style", "noscript", "header", "footer", "svg"]):
-                tag.decompose()
-            text = re.sub(r"\s+", " ", soup.get_text(separator="\n")).strip()
-            return text[:max_chars]
-
-        return ""
-    except Exception:
-        return ""
-
-
-# ===== OpenAI Extract Specs =====
-def openai_extract_specs(datasheet_text: str, kind: str = "module", max_input_chars: int = 20000) -> dict:
-
-    if not datasheet_text or not datasheet_text.strip():
-        return {}
-
-    text = datasheet_text.strip()[:max_input_chars]
-
-    user_prompt = (
-        "คุณจะได้รับข้อความจาก data sheet ของแผงโซลาร์เซลล์ กรุณาดึงค่าต่อไปนี้และตอบกลับเป็น JSON เท่านั้น:\n"
-        "- Vmp (V)\n- Voc (V)\n- Imp (A)\n- Isc (A)\n- Pm (W)\n\n"
-        "ถ้าไม่พบค่า ให้ใส่ null สำหรับค่านั้น\n\n"
-        f"ข้อความ:\n{text}"
-    ) if kind == "module" else (
-        "คุณจะได้รับข้อความจาก data sheet ของอินเวอร์เตอร์ กรุณาดึงค่าต่อไปนี้และตอบกลับเป็น JSON เท่านั้น:\n"
-        "- inv_power_ac (W)\n- inv_v_dc_max (V)\n- inv_i_sc_max (A)\n- inv_pv_power_max (W)\n\n"
-        "ถ้าไม่พบค่า ให้ใส่ null สำหรับค่านั้น\n\n"
-        f"ข้อความ:\n{text}"
+    creds = Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE,
+        scopes=scopes,
     )
 
-    try:
-        chat = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "คุณเป็นตัวดึงข้อมูลเชิงโครงสร้างจากเอกสาร ให้ตอบกลับเป็น JSON เท่านั้น"},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0,
-            timeout=30
-        )
+    client = gspread.authorize(creds)
+    return client.open_by_key(SPREADSHEET_KEY)
 
-        content = re.sub(r"```json|```", "", chat.choices[0].message["content"]).strip()
+# =========================================================
+# AUTO DETECT WORKSHEET
+# =========================================================
 
+def detect_worksheet_from_text(text: str, spreadsheet):
+    text = text.lower()
+
+    for sheet_name, keywords in TAB_KEYWORDS.items():
+        for kw in keywords:
+            if kw in text:
+                try:
+                    return spreadsheet.worksheet(sheet_name)
+                except gspread.exceptions.WorksheetNotFound:
+                    st.warning(f"⚠️ ไม่พบ tab: {sheet_name}")
+
+    # fallback
+    return spreadsheet.worksheet(DEFAULT_TAB)
+
+# =========================================================
+# LOAD DATABASE FROM WORKSHEET
+# =========================================================
+
+def load_db(worksheet):
+    records = worksheet.get_all_records()
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records)
+
+# =========================================================
+# APPEND ROW TO WORKSHEET
+# =========================================================
+
+def append_to_sheet(worksheet, row: list):
+    worksheet.append_row(
+        row,
+        value_input_option="USER_ENTERED"
+    )
+
+# =========================================================
+# HIGH-LEVEL HELPER (ใช้กับ SerpAPI)
+# =========================================================
+
+def save_search_result_to_sheet(
+    search_query: str,
+    brand: str,
+    model: str,
+    power: float,
+    datasheet_url: str,
+    source: str = "Google"
+):
+    spreadsheet = connect_spreadsheet()
+
+    worksheet = detect_worksheet_from_text(
+        f"{search_query} {brand} {model}",
+        spreadsheet
+    )
+
+    append_to_sheet(worksheet, [
+        brand,
+        model,
+        power,
+        datasheet_url,
+        source,
+        datetime.now().strftime("%Y-%m-%d %H:%M"),
+        search_query
+    ])
+
+    return worksheet.title
+
+
+import numpy as np
+import pandas as pd
+
+
+# ---------------------------------------------------------
+# Detect inverter AC column automatically
+# ---------------------------------------------------------
+def find_ac_column(df):
+    candidates = [
+        "Power_kW",
+        "AC_kW",
+        "Rated Power",
+        "AC Power (kW)",
+        "AC Power"
+    ]
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+# ---------------------------------------------------------
+# 🔎 LLM Explanation Layer (Auto Fastest Priority)
+# ---------------------------------------------------------
+def generate_llm_explanation(prompt, GEMINI_KEY=None, OPENAI_KEY=None):
+
+    openai_error = None
+    gemini_error = None
+
+    # =====================================================
+    # 1Priority: OpenAI (Fast + Stable)
+    # =====================================================
+    if OPENAI_KEY:
         try:
-            return json.loads(content)
-        except Exception:
-            m = re.search(r"\{.*\}", content, flags=re.S)
-            return json.loads(m.group(0)) if m else {}
+            from openai import OpenAI
 
-    except Exception:
-        return {}
+            client = OpenAI(api_key=OPENAI_KEY)
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",   # ⚡ fastest stable
+                messages=[
+                    {"role": "system", "content": "You are a professional solar PV engineer."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=500,
+            )
+
+            content = response.choices[0].message.content
+
+            if content:
+                return content.strip()
+
+        except Exception as e:
+            openai_error = str(e)
+
+    # =====================================================
+    # Fallback: Gemini
+    # =====================================================
+    if GEMINI_KEY:
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=GEMINI_KEY)
+
+            # Try stable models in order
+            gemini_models = [
+                "models/gemini-1.5-flash",
+                "models/gemini-1.5-pro",
+                "gemini-pro","models/gemini-2.5-flash"
+            ]
+
+            for model_name in gemini_models:
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(prompt)
+
+                    if hasattr(response, "text") and response.text:
+                        return response.text.strip()
+
+                except Exception as inner:
+                    gemini_error = str(inner)
+                    continue
+
+        except Exception as e:
+            gemini_error = str(e)
+
+    # =====================================================
+    # Deterministic Fallback
+    # =====================================================
+    return f"""
+AI explanation unavailable.
+
+OpenAI error: {openai_error}
+Gemini error: {gemini_error}
+
+System proceeds with deterministic MCDM result only.
+"""
 
 
-# ===== Safe Float =====
-def safe_float(x, default=None):
+# ---------------------------------------------------------
+# Gaussian Function
+# ---------------------------------------------------------
+def gaussian_penalty(x, x0, sigma):
+    sigma = max(float(sigma), 1e-6)
+    return np.exp(-((x - x0) / sigma) ** 2)
+# ---------------------------------------------------------
+# Main Hybrid Selection Function
+# ---------------------------------------------------------
+def ai_select_from_database(
+    panels_df,
+    inverters_df,
+    dc_capacity,
+    dc_ac_ratio,
+    area,
+    GEMINI_KEY=None,
+    OPENAI_KEY=None
+):
 
+    if panels_df.empty or inverters_df.empty:
+        return "⚠️ Database is empty."
+
+    # =====================================================
+    # Deterministic MCDM Selection
+    # =====================================================
+
+    ac_col = find_ac_column(inverters_df)
+    if ac_col is None:
+        return "❌ Cannot detect inverter AC power column."
+
+    df_inv = inverters_df.copy()
+    df_inv[ac_col] = pd.to_numeric(df_inv[ac_col], errors="coerce")
+    df_inv = df_inv.dropna(subset=[ac_col])
+
+    if df_inv.empty:
+        return "⚠️ No valid inverter data."
+
+    # ---- DC/AC Ratio
+    df_inv["ratio"] = dc_capacity / df_inv[ac_col]
+
+    # ---- Gaussian Scores
+    df_inv["score_ratio"] = gaussian_penalty(df_inv["ratio"], 1.1, 0.15)
+    df_inv["score_capacity"] = gaussian_penalty(
+        df_inv[ac_col], dc_capacity, dc_capacity * 0.2
+    )
+
+    # ---- Weighted Sum
+    w_ratio = 0.6
+    w_capacity = 0.4
+
+    df_inv["total_score"] = (
+        w_ratio * df_inv["score_ratio"] +
+        w_capacity * df_inv["score_capacity"]
+    )
+
+    df_inv = df_inv.sort_values("total_score", ascending=False)
+
+    top_inverters = df_inv.head(3)
+    best_inv = top_inverters.iloc[0]
+
+    # =====================================================
+    # Panel Selection (Gaussian Power Preference)
+    # =====================================================
+
+    df_pan = panels_df.copy()
+
+    if "Pm(W)" in df_pan.columns:
+        df_pan["Pm(W)"] = pd.to_numeric(df_pan["Pm(W)"], errors="coerce")
+        df_pan["score_power"] = gaussian_penalty(
+            df_pan["Pm(W)"], 550, 100
+        )
+        df_pan = df_pan.sort_values("score_power", ascending=False)
+
+    top_panels = df_pan.head(3)
+    best_panel = top_panels.iloc[0]
+
+    # =====================================================
+    # Build LLM Prompt
+    # =====================================================
+
+    prompt = f"""
+You are a solar PV engineer.
+
+Selection method: Gaussian Weighted Multi-Criteria Decision Making.
+
+PROJECT DATA:
+DC Capacity = {dc_capacity:.2f} kWp
+DC/AC Ratio = {dc_ac_ratio:.2f}
+Roof Area = {area:.2f} m²
+
+TOP INVERTERS:
+{top_inverters[[ac_col, "ratio", "total_score"]].to_string(index=False)}
+
+TOP PANELS:
+{top_panels.head(3).to_string(index=False)}
+
+SELECTED COMPONENTS:
+Inverter: {best_inv.get("Brand","")} {best_inv.get("Model","")}
+Panel: {best_panel.get("Brand","")} {best_panel.get("Model","")}
+
+Explain briefly why these rank highest based on:
+- DC/AC optimization
+- Capacity proximity
+- Practical engineering suitability
+
+Do not change the selected models.
+Keep concise and professional.
+"""
+
+    explanation = generate_llm_explanation(
+        prompt,
+        GEMINI_KEY=GEMINI_KEY,
+        OPENAI_KEY=OPENAI_KEY
+    )
+
+    # =====================================================
+    # Final Output
+    # =====================================================
+
+    result = f"""
+====================================================
+DETERMINISTIC SELECTION 
+====================================================
+
+Selected Inverter:
+{best_inv.get("Brand","")} {best_inv.get("Model","")}
+AC Rating: {best_inv[ac_col]} kW
+
+Selected Panel:
+{best_panel.get("Brand","")} {best_panel.get("Model","")}
+
+----------------------------------------------------
+AI ENGINEERING EXPLANATION
+----------------------------------------------------
+{explanation}
+"""
+
+    return result
+
+
+
+
+
+def irr(cashflows, guess=0.1):
+    r = guess
+    for _ in range(100):
+        f = sum(cf / ((1 + r) ** i) for i, cf in enumerate(cashflows))
+        df = sum(-i * cf / ((1 + r) ** (i + 1)) for i, cf in enumerate(cashflows))
+        if abs(df) < 1e-9:
+            break
+        r -= f / df
+    return r
+
+
+def get_value(row, *possible_cols, default=None):
+    for col in possible_cols:
+        if col in row and pd.notna(row[col]):
+            return row[col]
+    return default
+
+
+def pick_column(df, *candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+# ---- INIT STATE  ----
+if "run_design" not in st.session_state:
+    st.session_state.run_design = False
+
+with st.sidebar.form("pv_design_form"):
+
+    # ---------- LOAD & RESOURCE ----------
+    st.header("ข้อมูลโหลดไฟฟ้า")
+
+    st.number_input(
+        "พลังงานไฟฟ้าต่อวัน (kWh/day)",
+        min_value=0.0,
+        value=30.0,
+        step=1.0,
+        key="E_day"
+    )
+
+    st.number_input(
+        "ชั่วโมงแสงอาทิตย์ (Peak Sun Hours)",
+        min_value=1.0,
+        max_value=7.0,
+        value=4.5,
+        step=0.1,
+        key="H_sun"
+    )
+
+    st.slider(
+        "Performance Ratio (PR)",
+        0.6, 0.9, 0.8, 0.01,
+        key="PR"
+    )
+
+    # ---------- ROOF AREA ----------
+    st.header("พื้นที่ติดตั้ง")
+
+    st.number_input(
+        "พื้นที่หลังคาใช้งานได้ (m²)",
+        min_value=1.0,
+        value=50.0,
+        step=1.0,
+        key="area"
+    )
+
+    # ---------- PV MODULE ----------
+    st.header("สเปคแผงโซลาร์ (ต่อแผง)")
+
+    st.number_input("Vmp (V)", 10.0, value=41.0, step=0.1, key="Vmp")
+    st.number_input("Voc (V)", 10.0, value=50.0, step=0.1, key="Voc")
+    st.number_input("Imp (A)", 1.0, value=13.0, step=0.1, key="Imp")
+    st.number_input("Isc (A)", 1.0, value=13.5, step=0.1, key="Isc")
+    st.number_input("กำลังแผง (Pm, W)", 100, value=550, step=5, key="Pm")
+
+    # ---------- INVERTER ----------
+    st.header("สเปคอินเวอร์เตอร์")
+
+    st.number_input(
+        "AC Rated Power (W)",
+        min_value=1000,
+        value=10000,
+        step=500,
+        key="inv_power_ac"
+    )
+
+    st.number_input(
+        "DC Max Voltage (V)",
+        min_value=300,
+        value=1100,
+        step=50,
+        key="inv_v_dc_max"
+    )
+
+    st.number_input(
+        "Max Input Current / MPPT (A)",
+        min_value=5.0,
+        value=25.0,
+        step=1.0,
+        key="inv_i_sc_max"
+    )
+
+    st.number_input(
+        "Max PV Power (W)",
+        min_value=1000,
+        value=13000,
+        step=500,
+        key="inv_pv_power_max"
+    )
+
+    # ---------- ECONOMICS ----------
+    st.header("เศรษฐศาสตร์โครงการ")
+
+    st.number_input(
+        "ต้นทุนลงทุน (CAPEX, บาท)",
+        min_value=0,
+        value=350000,
+        step=10000,
+        key="CAPEX"
+    )
+
+    st.number_input(
+        "ค่าไฟฟ้า (Tariff, บาท/kWh)",
+        min_value=0.0,
+        value=4.0,
+        step=0.1,
+        key="tariff"
+    )
+
+    st.number_input(
+        "อายุโครงการ (ปี)",
+        min_value=1,
+        value=25,
+        step=1,
+        key="years"
+    )
+
+    # ---------- CALCULATE BUTTON ----------
+    submitted = st.form_submit_button(" Calculate PV System")
+
+# ---- TRIGGER DESIGN RUN ----
+if submitted:
+    st.session_state.run_design = True
+
+
+
+
+
+
+
+# =========================================================
+# DATABASE VIEW (MULTI-TAB)
+# =========================================================
+
+spreadsheet = connect_spreadsheet()
+
+st.header("Equipment Database ")
+
+tabs = {
+    "Solar Panels": "Solar_Panels",
+    "Inverters": "Inverters",
+    "Accessories": "Accessories",
+}
+
+tab_ui = st.tabs(list(tabs.keys()))
+
+# Initialize session storage
+if "panels_db" not in st.session_state:
+    st.session_state["panels_db"] = pd.DataFrame()
+
+if "inverters_db" not in st.session_state:
+    st.session_state["inverters_db"] = pd.DataFrame()
+
+if "accessories_db" not in st.session_state:
+    st.session_state["accessories_db"] = pd.DataFrame()
+
+
+for ui_tab, sheet_name in zip(tab_ui, tabs.values()):
+    with ui_tab:
+        try:
+            ws = spreadsheet.worksheet(sheet_name)
+            df = load_db(ws)
+
+            if df.empty:
+                st.info(f"{sheet_name} ยังไม่มีข้อมูล")
+            else:
+                st.dataframe(df, use_container_width=True)
+
+
+                if sheet_name == "Solar_Panels":
+                    st.session_state["panels_db"] = df
+
+                elif sheet_name == "Inverters":
+                    st.session_state["inverters_db"] = df
+
+                elif sheet_name == "Accessories":
+                    st.session_state["accessories_db"] = df
+
+        except Exception as e:
+            st.error(f"❌ ไม่สามารถโหลดแท็บ {sheet_name}")
+            st.caption(str(e))
+
+
+# =========================================================
+#  SERPAPI SEARCH
+# =========================================================
+st.header(" ค้นหาอุปกรณ์ ")
+
+c1, c2 = st.columns(2)
+
+with c1:
+    eq_type = st.selectbox("ประเภทอุปกรณ์ (Type)", ["Solar_Panels", "Inverters"])
+    brand   = st.text_input("ยี่ห้อ (Brand)")
+    model   = st.text_input("รุ่น (Model)")
+    power   = st.number_input("กำลังไฟฟ้า (Power, W)", min_value=0)
+
+with c2:
+    query = st.text_input(
+        "คำค้นหา (Search query)",
+        value=f"{brand} {model} datasheet filetype:pdf".strip()
+    )
+
+# -------------------------------------------------
+# SEARCH BUTTON
+# -------------------------------------------------
+if st.button(" Search & Save"):
+
+    if not SERPAPI_KEY:
+        st.error("❌ ยังไม่ได้ตั้งค่า SERPAPI_KEY")
+        st.stop()
+
+    if not brand or not model:
+        st.warning("⚠️ กรุณากรอก Brand และ Model")
+        st.stop()
+
+    # -------------------------------------------------
+    # SELECT WORKSHEET
+    # -------------------------------------------------
     try:
-        if x is None:
-            return default
-        s = re.sub(r"[,\s%A-Za-zก-ฮ\u0E00-\u0E7F]", "", str(x).strip())
-        s = re.sub(r"[^\d\.\-eE]", "", s)
-        return float(s) if s not in ("", ".", "-", "nan") else default
+        ws = spreadsheet.worksheet(eq_type)
     except Exception:
+        st.error(f"❌ ไม่พบแท็บ {eq_type} ใน Google Sheets")
+        st.stop()
+
+    # -------------------------------------------------
+    # LOAD EXISTING DATA
+    # -------------------------------------------------
+    records = ws.get_all_records()
+    df_exist = pd.DataFrame(records) if records else pd.DataFrame()
+
+    # -------------------------------------------------
+    # SERPAPI GOOGLE SEARCH
+    # -------------------------------------------------
+    params = {
+        "engine": "google",
+        "q": query,
+        "api_key": SERPAPI_KEY,
+        "num": 10,
+    }
+
+    res = GoogleSearch(params).get_dict()
+
+    # -------------------------------------------------
+    # COLLECT PDF DATASHEET CANDIDATES
+    # -------------------------------------------------
+    pdf_candidates = []
+
+    for r in res.get("organic_results", []):
+        link    = r.get("link", "")
+        title   = r.get("title", "").lower()
+        snippet = r.get("snippet", "").lower()
+
+        if link.lower().endswith(".pdf"):
+            score = 0
+            if "datasheet" in title or "data sheet" in title:
+                score += 2
+            if "specification" in title:
+                score += 1
+            if brand.lower() in title:
+                score += 1
+            if model.lower() in title:
+                score += 2
+
+            pdf_candidates.append({
+                "title": r.get("title", ""),
+                "link": link,
+                "score": score,
+                "source": r.get("source", "Google"),
+            })
+
+    # sort by relevance score
+    pdf_candidates = sorted(
+        pdf_candidates,
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    # -------------------------------------------------
+    # SHOW FOUND LINKS
+    # -------------------------------------------------
+    st.markdown("### Datasheet ที่พบ ")
+
+    if pdf_candidates:
+        for i, p in enumerate(pdf_candidates[:3], start=1):
+            st.markdown(
+                f"**{i}. {p['title']}**  \n"
+                f" [เปิด Datasheet PDF]({p['link']})  \n"
+                f"แหล่งที่มา (Source): {p['source']}"
+            )
+    else:
+        st.warning("⚠️ ไม่พบ Datasheet PDF ที่ชัดเจน")
+
+    # -------------------------------------------------
+    # PICK BEST DATASHEET (AUTO)
+    # -------------------------------------------------
+    datasheet = ""
+    source = "Google"
+
+    if pdf_candidates:
+        datasheet = pdf_candidates[0]["link"]
+        source = pdf_candidates[0]["source"]
+
+    # -------------------------------------------------
+    # DUPLICATE CHECK (Brand + Model)
+    # -------------------------------------------------
+    if not df_exist.empty and {"Brand", "Model"}.issubset(df_exist.columns):
+        dup = df_exist[
+            (df_exist["Brand"].str.lower() == brand.lower()) &
+            (df_exist["Model"].str.lower() == model.lower())
+        ]
+        if not dup.empty:
+            st.warning("⚠️ อุปกรณ์นี้มีอยู่แล้วในฐานข้อมูล")
+            st.dataframe(dup)
+            st.stop()
+
+    # -------------------------------------------------
+    # APPEND TO GOOGLE SHEET
+    # -------------------------------------------------
+    ws.append_row([
+        brand,                       # Brand
+        model,                       # Model
+        power,                       # Power (W)
+        "",                          # Price
+        datasheet,                   # Datasheet URL
+        source,                      # Source
+        datetime.now().strftime("%Y-%m-%d %H:%M"),
+        query
+    ], value_input_option="USER_ENTERED")
+
+    st.success(f"✅ บันทึกอุปกรณ์ลงแท็บ {eq_type} เรียบร้อย")
+    st.rerun()
+
+
+import numpy as np
+import streamlit as st
+from numpy_financial import irr
+
+# =========================================================
+#  PV SYSTEM DESIGN
+# =========================================================
+
+# ---------------------------------------------------------
+# Helper: safe read from session_state
+# ---------------------------------------------------------
+def ss(key, default=0.0):
+    try:
+        return float(st.session_state.get(key, default))
+    except:
         return default
 
 
+st.header(" PV System Design | การออกแบบระบบผลิตไฟฟ้าพลังงานแสงอาทิตย์")
 
-# ===== Session state defaults =====
-defaults_module = {"Vmp": 43.71, "Voc": 54.08, "Imp": 14.30, "Isc": 15.03, "Pm": 625.0}
-defaults_inverter = {"inv_power_ac": 10000.0, "inv_v_dc_max": 600.0, "inv_i_sc_max": 20.0, "inv_pv_power_max": 15000.0}
-for k, v in defaults_module.items():
-    st.session_state.setdefault(k, v)
-for k, v in defaults_inverter.items():
-    st.session_state.setdefault(k, v)
+# =========================================================
+# ⏯ RUN CONTROL
+# =========================================================
+if not st.session_state.get("run_design", False):
+    st.info("⬅️ กรุณากรอกข้อมูลทาง Sidebar แล้วกด **Run PV System Design**")
+    st.stop()
 
+## =========================================================
+# DESIGN BASIS (ENGINEERING VALIDATION)
+# =========================================================
+st.markdown("## Design Basis | ข้อมูลตั้งต้น")
 
+E_day = ss("E_day")      # kWh/day
+H_sun = ss("H_sun")      # h/day (PSH)
+PR    = ss("PR")         # -
+area  = ss("area")       # m²
 
-# ===== Sidebar inputs (จะถูกแทนค่าหลังดึง data sheet) =====
-st.sidebar.header("ข้อมูลโหลดและสภาพแวดล้อม")
-E_day = st.sidebar.number_input("พลังงานที่ใช้ช่วงกลางวัน (kWh/day)", min_value=0.0, value=30.0, step=0.5)
-H_sun = st.sidebar.number_input("ชั่วโมงแสงอาทิตย์เฉลี่ยต่อวัน (hr)", min_value=0.0, value=4.5, step=0.1)
-PR = st.sidebar.slider("Performance Ratio (PR)", 0.6, 0.9, 0.80, 0.01)
+# ---------------------------------------------------------
+# BASIC VALIDATION
+# ---------------------------------------------------------
+if min(E_day, H_sun, PR, area) <= 0:
+    st.error("❌ ข้อมูล Load / PSH / PR / Area ต้องมากกว่า 0")
+    st.stop()
 
-st.sidebar.header("ข้อมูลแผงโซลาร์เซลล์ (จาก data sheet)")
-Vmp = st.sidebar.number_input("Vmp (V)", value=st.session_state["Vmp"])
-Voc = st.sidebar.number_input("Voc (V)", value=st.session_state["Voc"])
-Imp = st.sidebar.number_input("Imp (A)", value=st.session_state["Imp"])
-Isc = st.sidebar.number_input("Isc (A)", value=st.session_state["Isc"])
-Pm = st.sidebar.number_input("กำลังสูงสุดต่อแผง (W)", value=st.session_state["Pm"])
+# ---------------------------------------------------------
+# ENGINEERING RANGE CHECK (PVsyst mindset)
+# ---------------------------------------------------------
+warnings = []
 
-st.sidebar.header("ข้อมูลอินเวอร์เตอร์ (จาก data sheet)")
-inv_power_ac = st.sidebar.number_input("กำลังอินเวอร์เตอร์ AC (W)", value=st.session_state["inv_power_ac"])
-inv_v_dc_max = st.sidebar.number_input("DC max voltage (V)", value=st.session_state["inv_v_dc_max"])
-inv_i_sc_max = st.sidebar.number_input("Max. short-circuit current (A)", value=st.session_state["inv_i_sc_max"])
-inv_pv_power_max = st.sidebar.number_input("Max. PV power (W)", value=st.session_state["inv_pv_power_max"])
+if not (1.0 <= H_sun <= 7.0):
+    warnings.append("PSH อยู่นอกช่วงปกติ (1–7 h/day)")
 
-st.sidebar.header("เศรษฐศาสตร์")
-CAPEX = st.sidebar.number_input("ราคาติดตั้ง (บาท)", value=350000.0, step=1000.0)
-tariff = st.sidebar.number_input("ค่าไฟฟ้า (บาท/kWh)", value=4.2, step=0.1)
-years = st.sidebar.number_input("ระยะเวลาวิเคราะห์ (ปี)", value=20, step=1)
-discount_rate = st.sidebar.slider("Discount Rate (ต่อปี)", 0.0, 0.2, 0.08, 0.01)
-degradation = st.sidebar.slider("การเสื่อมสมรรถนะ (% ต่อปี)", 0.0, 2.0, 0.7, 0.1)
+if not (0.65 <= PR <= 0.90):
+    warnings.append("PR อยู่นอกช่วงที่พบได้ทั่วไป (0.65–0.90)")
 
-# ===== ปุ่มวิเคราะห์ =====
-if st.sidebar.button("วิเคราะห์"):
-    # อัปเดตค่าใน session_state
-    st.session_state["E_day"] = E_day
-    st.session_state["H_sun"] = H_sun
-    st.session_state["PR"] = PR
-    st.session_state["Vmp"] = Vmp
-    st.session_state["Voc"] = Voc
-    st.session_state["Imp"] = Imp
-    st.session_state["Isc"] = Isc
-    st.session_state["Pm"] = Pm
-    st.session_state["inv_power_ac"] = inv_power_ac
-    st.session_state["inv_v_dc_max"] = inv_v_dc_max
-    st.session_state["inv_i_sc_max"] = inv_i_sc_max
-    st.session_state["inv_pv_power_max"] = inv_pv_power_max
-    st.session_state["CAPEX"] = CAPEX
-    st.session_state["tariff"] = tariff
-    st.session_state["years"] = years
-    st.session_state["discount_rate"] = discount_rate
-    st.session_state["degradation"] = degradation
+if E_day < 5:
+    warnings.append("โหลดไฟฟ้าค่อนข้างต่ำ อาจไม่คุ้มค่าทางเศรษฐศาสตร์")
 
-    st.success("อัปเดตข้อมูลทั้งหมดเรียบร้อยแล้ว")
+if area < 10:
+    warnings.append("พื้นที่ติดตั้งจำกัด อาจจำกัดขนาดระบบ")
 
+# ---------------------------------------------------------
+# DISPLAY WARNINGS (non-blocking)
+# ---------------------------------------------------------
+for w in warnings:
+    st.warning(f"⚠️ {w}")
 
-
-
-
-# ===== Section: ค้นหาและดึงสเปคจาก data sheet =====
-
-#
-
-st.markdown(" ค้นหาสเปคจาก data sheet ")
-
-colA, colB = st.columns(2)
-
-# ===== ฝั่งแผงโซลาร์ =====
-with colA:
-    st.subheader("แผงโซลาร์ (PV Module)")
-    module_query = st.text_input("คำค้นหาแผง", value="", key="module_query")
-
-    if "module_results" not in st.session_state:
-        st.session_state["module_results"] = []
-
-    if st.button("ค้นหาแผง", key="search_module"):
-        st.session_state["module_results"] = serpapi_search(module_query)
-
-    if st.session_state["module_results"]:
-        options = [f"{i+1}. {r['title']}" for i, r in enumerate(st.session_state["module_results"])]
-        idx = st.selectbox("เลือกผลลัพธ์", list(range(len(options))),
-                           format_func=lambda i: options[i], key="module_select")
-        selected = st.session_state["module_results"][idx]
-        st.write(f"ลิงก์ที่เลือก: {selected['link']}")
-
-    # ช่องอัปโหลดไฟล์ datasheet
-    uploaded_module = st.file_uploader("อัปโหลดไฟล์ datasheet ของแผง ",
-                                       type=["pdf", "png", "jpg", "jpeg"], key="upload_module")
-
-    if uploaded_module is not None and st.button("อัปเดตสเปคแผง", key="update_module"):
-        text = auto_extract_text(uploaded_module)
-        specs = openai_extract_specs(text, kind="module") if text else {}
-        if specs:
-            st.json(specs)
-            for k in ["Vmp", "Voc", "Imp", "Isc", "Pm"]:
-                st.session_state[k] = safe_float(specs.get(k), st.session_state[k])
-            st.success("อัปเดตค่าสเปคแผงใน Sidebar แล้ว")
-        else:
-            st.error("ไม่สามารถสกัดค่าสเปคจากไฟล์ที่อัปโหลดได้")
-
-# ===== ฝั่งอินเวอร์เตอร์ =====
-with colB:
-    st.subheader("อินเวอร์เตอร์ (Inverter)")
-    inverter_query = st.text_input("คำค้นหาอินเวอร์เตอร์", value="", key="inverter_query")
-
-    if "inverter_results" not in st.session_state:
-        st.session_state["inverter_results"] = []
-
-    if st.button("ค้นหาอินเวอร์เตอร์", key="search_inverter"):
-        st.session_state["inverter_results"] = serpapi_search(inverter_query)
-
-    if st.session_state["inverter_results"]:
-        options = [f"{i+1}. {r['title']}" for i, r in enumerate(st.session_state["inverter_results"])]
-        idx2 = st.selectbox("เลือกผลลัพธ์", list(range(len(options))),
-                            format_func=lambda i: options[i], key="inv_select")
-        selected2 = st.session_state["inverter_results"][idx2]
-        st.write(f"ลิงก์ที่เลือก: {selected2['link']}")
-
-    # ช่องอัปโหลดไฟล์ datasheet
-    uploaded_inverter = st.file_uploader("อัปโหลดไฟล์ datasheet ของอินเวอร์เตอร์ (PDF/รูปภาพ)",
-                                         type=["pdf", "png", "jpg", "jpeg"], key="upload_inverter")
-
-    if uploaded_inverter is not None and st.button("อัปเดตสเปคอินเวอร์เตอร์", key="update_inverter"):
-        text2 = auto_extract_text(uploaded_inverter)
-        specs2 = openai_extract_specs(text2, kind="inverter") if text2 else {}
-        if specs2:
-            st.json(specs2)
-            for k in ["inv_power_ac", "inv_v_dc_max", "inv_i_sc_max", "inv_pv_power_max"]:
-                st.session_state[k] = safe_float(specs2.get(k), st.session_state[k])
-            st.success("อัปเดตค่าสเปคอินเวอร์เตอร์ใน Sidebar แล้ว")
-        else:
-            st.error("ไม่สามารถสกัดค่าสเปคจากไฟล์ที่อัปโหลดได้")
-
-st.caption("ค้นหา datasheet → เปิดลิงก์ → ดาวน์โหลด/Captureภาพ → อัปโหลดไฟล์ PDF หรือรูปภาพเพื่ออัปเดตค่า")
-
-
-
-
-
-# ===== Section: คำนวณระบบและตรวจสอบ =====
-st.markdown("---")
-st.markdown("## คำนวณระบบและตรวจสอบการจัด String/อินเวอร์เตอร์")
-
-# กำลังติดตั้งที่เหมาะสม
-P_pv_kWp = E_day / (H_sun * PR) if H_sun * PR > 0 else 0.0
-E_daily_est = P_pv_kWp * H_sun * PR
-
-col1, col2 = st.columns(2)
-with col1:
-    st.write(f"• กำลังติดตั้งที่เหมาะสม: {P_pv_kWp:.2f} kWp")
-with col2:
-    st.write(f"• พลังงานผลิตโดยประมาณ: {E_daily_est:.2f} kWh/day")
-
-# ตรวจสอบ String แบบพื้นฐาน
-st.subheader("การจัด String")
-M_series = st.number_input("จำนวนแผงต่อ String (อนุกรม)", min_value=1, value=10, step=1)
-Voc_array = Voc * M_series
-Vmp_array = Vmp * M_series
-Isc_array = Isc
-P_array = Pm * M_series
-
-col3, col4, col5, col6 = st.columns(4)
-with col3:
-    st.write(f"Voc รวม: {Voc_array:.2f} V")
-with col4:
-    st.write(f"Vmp รวม: {Vmp_array:.2f} V")
-with col5:
-    st.write(f"Isc String: {Isc_array:.2f} A")
-with col6:
-    st.write(f"กำลังรวมต่อ String: {P_array:.2f} W")
-
-st.subheader("ผลตรวจสอบอินเวอร์เตอร์")
-checks = [
-    ("Voc รวมไม่เกิน DC max", Voc_array <= inv_v_dc_max),
-    ("Isc String ไม่เกิน Isc max/MPPT", Isc_array <= inv_i_sc_max),
-    ("กำลังรวมไม่เกิน Max PV Power", P_array <= inv_pv_power_max),
-]
-for name, ok in checks:
-    st.write(f"{'✅' if ok else '❌'} {name}")
-
-# ===== 3) Economic Analysis =====
-st.header("การวิเคราะห์เศรษฐศาสตร์")
-E_year = E_daily_est * 365.0
-cashflows = [-CAPEX]
-for y in range(1, int(years) + 1):
-    factor = (1 - degradation / 100.0) ** (y - 1)
-    savings = E_year * tariff * factor
-    cashflows.append(savings)
-
-payback = CAPEX / (E_year * tariff) if (E_year * tariff) > 0 else float("inf")
-npv_val = sum(cf / ((1 + discount_rate) ** i) for i, cf in enumerate(cashflows))
-
-# IRR calculation
-def irr(cashflows, guess: float = 0.1, max_iter: int = 100, tol: float = 1e-6) -> float:
-    r = guess
-    for _ in range(max_iter):
-        f = sum(cf / ((1 + r) ** i) for i, cf in enumerate(cashflows))
-        df = sum(-i * cf / ((1 + r) ** (i + 1)) for i, cf in enumerate(cashflows))
-        if abs(df) < 1e-12:
-            break
-        r_new = r - f / df
-        if abs(r_new - r) < tol:
-            return r_new
-        r = r_new
-    return r
-
-irr_val = irr(cashflows, guess=0.1)
-
-st.write(f"• ระยะเวลาคืนทุน (Payback Period): {payback:.2f} ปี")
-st.write(f"• มูลค่าปัจจุบันสุทธิ (NPV): {npv_val:,.0f} บาท")
-st.write(f"• อัตราผลตอบแทนภายใน (IRR): {irr_val*100:.2f}%")
-
-# ===== 4) Export Results =====
-st.header("การส่งออกผลลัพธ์")
-
-# Excel Export (English)
-df_cf = pd.DataFrame({
-    "Year": list(range(0, int(years) + 1)),
-    "Cashflow (Baht)": cashflows
-})
-excel_buffer = BytesIO()
-with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
-    df_cf.to_excel(writer, sheet_name="Cashflows", index=False)
-excel_buffer.seek(0)
-
-st.download_button(
-    label=" Download Excel (Cashflows)",
-    data=excel_buffer,
-    file_name="solar_economics.xlsx"
+# ---------------------------------------------------------
+# ENGINEERING SUMMARY
+# ---------------------------------------------------------
+st.info(
+    f"""
+**Design Inputs Summary**
+- Daily energy demand: **{E_day:.1f} kWh/day**
+- Peak Sun Hours (PSH): **{H_sun:.2f} h/day**
+- Performance Ratio (PR): **{PR:.2f}**
+- Available area: **{area:.1f} m²**
+"""
 )
 
-# ===== สร้างกราฟสำหรับ PDF =====
-years_list = list(range(1, int(years) + 1))
-production = [E_daily_est * 365 * ((1 - degradation/100) ** (y-1)) for y in years_list]
+# =========================================================
+# PV CAPACITY SIZING
+# =========================================================
+st.markdown("## PV Capacity Sizing | คำนวณขนาดระบบ")
 
-years_with_0 = [0] + years_list
-yearly_savings = [E_daily_est * 365 * tariff * ((1 - degradation/100) ** (y-1)) for y in years_list]
-cashflows = [-CAPEX] + yearly_savings
-cumulative_cf = np.cumsum(cashflows)
+P_pv_load = E_day / (H_sun * PR)
+P_pv_area = area * 0.20          # ≈ 200 W/m²
 
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+P_pv_design = min(P_pv_load, P_pv_area)
+E_est_day   = P_pv_design * H_sun * PR
 
-# ===== สร้างกราฟคู่สำหรับ PDF =====
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+st.markdown(
+    f"""
+- PV from load: **{P_pv_load:.2f} kWp**
+- PV from area: **{P_pv_area:.2f} kWp**
 
-# กราฟซ้าย: Energy Production
-ax1 = axes[0]
-ax1.plot(years_list, production, marker='o', color='green', label="Yearly Energy Production")
-ax1.set_xlabel("Year")
-ax1.set_ylabel("Energy Production (kWh/year)")
-ax1.set_title("Yearly Electricity Production with Degradation")
-ax1.grid(True, linestyle=':', alpha=0.4)
-ax1.legend()
+✅ **Design PV Capacity: {P_pv_design:.2f} kWp**  
+Estimated Energy: **{E_est_day:.2f} kWh/day**
+"""
+)
 
-# กราฟขวา: Cashflow
-ax2 = axes[1]
-ax2.bar(years_with_0, cashflows, color=['crimson'] + ['steelblue']*len(yearly_savings), label="Yearly Cashflow")
-ax2.plot(years_with_0, cumulative_cf, marker='o', color='orange', label="Cumulative Cashflow")
-ax2.axhline(0, color='red', linestyle='--', label="Break-even Line")
-ax2.set_xlabel("Year")
-ax2.set_ylabel("Cashflow (Baht)")
-ax2.set_title("Yearly and Cumulative Cashflows")
-ax2.grid(True, linestyle=':', alpha=0.4)
-ax2.legend()
 
-# บันทึกกราฟเป็นรูปภาพ
-fig.savefig("graphs.png")
-plt.close(fig)
 
-# ===== สร้าง PDF =====
-pdf = FPDF()
-pdf.add_page()
-pdf.set_font("Arial", size=12)
+# =========================================================
+# PV MODULE (SIDEBAR | ENGINEERING VALIDATION)
+# =========================================================
+st.markdown("## PV Module | สเปคแผงจากผู้ใช้")
 
-# รายงานตัวเลข
-pdf.cell(0, 10, txt="Solar Rooftop Economic Analysis Report", ln=True)
-pdf.ln(5)
-pdf.cell(0, 10, txt=f"Optimal Installed Capacity: {P_pv_kWp:.2f} kWp", ln=True)
-pdf.cell(0, 10, txt=f"Estimated Daily Energy Production: {E_daily_est:.2f} kWh/day", ln=True)
-pdf.ln(5)
-pdf.cell(0, 10, txt=f"Payback Period: {payback:.2f} years", ln=True)
-pdf.cell(0, 10, txt=f"Net Present Value (NPV): {npv_val:,.0f} Baht", ln=True)
-pdf.cell(0, 10, txt=f"Internal Rate of Return (IRR): {irr_val*100:.2f}%", ln=True)
+Pm  = ss("Pm")     # W
+Vmp = ss("Vmp")    # V
+Voc = ss("Voc")    # V
+Imp = ss("Imp")    # A
+Isc = ss("Isc")    # A
 
-# แทรกรูปกราฟคู่
-pdf.add_page()
-pdf.image("graphs.png", x=10, y=30, w=180)
+# --- Basic sanity check ---
+if min(Pm, Vmp, Voc, Imp, Isc) <= 0:
+    st.error("❌ สเปคแผงไม่ครบหรือมีค่าติดลบ")
+    st.stop()
 
-# แปลงเป็น BytesIO สำหรับดาวน์โหลด
-pdf_bytes = pdf.output(dest='S').encode('latin1')
-pdf_buffer = BytesIO(pdf_bytes)
+# --- Electrical consistency checks (PVsyst-like) ---
+Pm_calc = Vmp * Imp
 
-# ปุ่มดาวน์โหลด PDF
-st.download_button(
-    label=" Download PDF (Summary + Graphs)",
-    data=pdf_buffer,
-    file_name="solar_summary_with_graphs.pdf")
+if Pm_calc < 0.9 * Pm or Pm_calc > 1.1 * Pm:
+    st.warning(
+        f"⚠️ ความไม่สอดคล้องของสเปคแผง\n"
+        f"Pm datasheet = {Pm:.0f} W\n"
+        f"Vmp × Imp = {Pm_calc:.0f} W\n"
+        "→ ตรวจสอบ datasheet อีกครั้ง"
+    )
+
+if Voc <= Vmp:
+    st.error("❌ Voc ต้องมากกว่า Vmp")
+    st.stop()
+
+if Isc <= Imp:
+    st.error("❌ Isc ต้องมากกว่า Imp")
+    st.stop()
+
+# --- Engineering info for transparency ---
+st.info(
+    f"""
+**Module Electrical Summary**
+- Rated Power (Pm): **{Pm:.0f} W**
+- Vmp / Imp: **{Vmp:.1f} V / {Imp:.1f} A**
+- Voc / Isc: **{Voc:.1f} V / {Isc:.1f} A**
+"""
+)
+
+# =========================================================
+# INVERTER (SIDEBAR)
+# =========================================================
+st.markdown("## Inverter | สเปคอินเวอร์เตอร์จากผู้ใช้")
+
+inv_ac = ss("inv_power_ac")      # W
+inv_v  = ss("inv_v_dc_max")      # V
+inv_i  = ss("inv_i_sc_max")      # A
+inv_pv = ss("inv_pv_power_max")  # W
+
+# Engineering assumptions (override later if needed)
+mppt_count = 1
+v_mppt_min = 200
+v_mppt_max = 850
+
+if min(inv_ac, inv_v, inv_i, inv_pv) <= 0:
+    st.error("❌ สเปค Inverter ไม่ถูกต้อง")
+    st.stop()
+
+dc_ac_actual = P_pv_design * 1000 / inv_ac
+
+if dc_ac_actual < 1.0:
+    st.warning("⚠️ Inverter ใหญ่เกินไป → Efficiency ต่ำ")
+elif dc_ac_actual > 1.35:
+    st.warning("⚠️ DC/AC ratio สูง → เสี่ยง clipping")
+else:
+    st.info("✅ ขนาด Inverter เหมาะสม")
+
+# =========================================================
+# STRING DESIGN
+# =========================================================
+st.markdown("## String Design | ออกแบบจำนวนแผงต่อ String")
+
+sf_voc_cold = 1.20
+sf_vmp_hot  = 0.90
+sf_current  = 1.25
+
+n_max_voc  = int(inv_v / (Voc * sf_voc_cold))
+n_max_mppt = int(v_mppt_max / Vmp)
+n_min_mppt = int(np.ceil(v_mppt_min / (Vmp * sf_vmp_hot)))
+
+panels_per_string = min(n_max_voc, n_max_mppt)
+
+if panels_per_string < n_min_mppt:
+    st.error("❌ ไม่สามารถจัด String ให้อยู่ใน MPPT window")
+    st.stop()
+
+st.info(f"✔ แผงต่อ String: **{panels_per_string} แผง**")
+
+# =========================================================
+# STRING QUANTITY (ENGINEERING-GRADE)
+# =========================================================
+st.markdown("## String Quantity | คำนวณจำนวน String")
+
+# --- Required DC sizing ---
+panels_required = int(np.ceil(P_pv_design * 1000 / Pm))
+strings_required = int(np.ceil(panels_required / panels_per_string))
+
+# --- Current limit per MPPT ---
+I_string = Isc * sf_current
+
+if I_string <= 0:
+    st.error("❌ กระแส String ไม่ถูกต้อง")
+    st.stop()
+
+strings_per_mppt_max = int(inv_i // I_string)
+
+if strings_per_mppt_max < 1:
+    st.error(
+        f"❌ Inverter รับกระแสไม่พอ\n"
+        f"I_string = {I_string:.1f} A > I_inv = {inv_i:.1f} A"
+    )
+    st.stop()
+
+strings_max = strings_per_mppt_max * mppt_count
+strings_used = min(strings_required, strings_max)
+
+# --- User feedback ---
+st.write(
+    f"""
+- Panels required: **{panels_required} แผง**
+- Strings required (ตามโหลด): **{strings_required} string**
+- Inverter รองรับได้สูงสุด: **{strings_max} string**
+"""
+)
+
+if strings_used < strings_required:
+    st.warning(
+        "⚠️ จำนวน String ถูกจำกัดด้วยกระแส Inverter\n"
+        "→ ระบบอาจผลิตไฟได้ไม่เต็มตาม Design PV"
+    )
+else:
+    st.success("✅ จำนวน String เพียงพอตาม Design PV")
+
+# --- DC power check vs inverter ---
+dc_power_installed = panels_per_string * strings_used * Pm
+
+if dc_power_installed > inv_pv:
+    st.warning(
+        f"⚠️ DC Power ติดตั้ง = {dc_power_installed/1000:.2f} kWp "
+        f"เกิน Inverter PV Max ({inv_pv/1000:.2f} kWp)"
+    )
+
+
+# =========================================================
+# MPPT ALLOCATION
+# =========================================================
+st.markdown("## MPPT Allocation | การกระจาย String")
+
+remaining = strings_used
+for i in range(1, mppt_count + 1):
+    s = min(strings_per_mppt_max, remaining)
+    remaining -= s
+    st.write(f"- MPPT {i}: **{s} string(s)**")
+
+# =========================================================
+# FINAL ELECTRICAL CHECK
+# =========================================================
+st.markdown("## Final Electrical Check | ตรวจสอบขั้นสุดท้าย")
+
+dc_capacity = panels_per_string * strings_used * Pm / 1000
+dc_ac_ratio = dc_capacity / (inv_ac / 1000)
+
+Voc_string = panels_per_string * Voc * sf_voc_cold
+Vmp_string = panels_per_string * Vmp * sf_vmp_hot
+
+st.success(
+    f"""
+### ✅ Final System Configuration
+- DC Capacity: **{dc_capacity:.2f} kWp**
+- DC/AC Ratio: **{dc_ac_ratio:.2f}**
+- Voc,string (cold): **{Voc_string:.0f} V**
+- Vmpp,string (hot): **{Vmp_string:.0f} V**
+"""
+)
+
+
+
+
+
+
+st.write(st.session_state.get("ai_result", "ยังไม่ได้เรียก AI"))
+
+# =========================================================
+# FINANCIAL PERFORMANCE (PVsyst-Grade)
+# =========================================================
+st.header("Financial Performance | PVsyst-grade Analysis")
+
+# -------------------------------
+# USER INPUTS / ASSUMPTIONS
+# -------------------------------
+CAPEX = float(st.session_state.get("CAPEX", 480_000))   # THB
+project_life = int(st.session_state.get("years", 25))
+
+tariff_self = float(st.session_state.get("tariff", 4.0))   # THB/kWh
+tariff_export = float(st.session_state.get("export_tariff", 0.0))
+
+self_use_ratio = float(st.session_state.get("self_use", 0.6))  # 0–1
+
+discount_rate = 0.08            # WACC
+degradation = 0.005             # 0.5 %/year
+om_ratio = 0.015                # 1.5 % of CAPEX / year
+
+inv_replacement_year = 12
+inv_replacement_cost = 80_000   # THB
+
+# -------------------------------
+# ENERGY MODEL (PV OUTPUT)
+# -------------------------------
+# ต้องเป็น PV energy ไม่ใช่ load
+E_year_1 = E_est_day * 365      # kWh/year (จาก PV sizing)
+
+if E_year_1 <= 0 or CAPEX <= 0:
+    st.warning("⚠️ Financial calculation not possible")
+    st.stop()
+
+# -------------------------------
+# CASHFLOW CALCULATION
+# -------------------------------
+cashflows = [-CAPEX]
+discounted_cum = -CAPEX
+
+simple_payback = None
+discounted_payback = None
+
+for y in range(1, project_life + 1):
+
+    # PV degradation
+    E_y = E_year_1 * ((1 - degradation) ** (y - 1))
+
+    # Revenue split
+    revenue = (
+        E_y * self_use_ratio * tariff_self +
+        E_y * (1 - self_use_ratio) * tariff_export
+    )
+
+    # O&M
+    om_cost = CAPEX * om_ratio
+
+    # Inverter replacement
+    replacement = inv_replacement_cost if y == inv_replacement_year else 0
+
+    net_cf = revenue - om_cost - replacement
+    cashflows.append(net_cf)
+
+    # Payback tracking
+    if simple_payback is None:
+        if sum(cashflows[1:]) >= CAPEX:
+            simple_payback = y
+
+    discounted_cf = net_cf / ((1 + discount_rate) ** y)
+    discounted_cum += discounted_cf
+
+    if discounted_payback is None and discounted_cum >= 0:
+        discounted_payback = y
+
+# -------------------------------
+# FINANCIAL METRICS
+# -------------------------------
+npv = sum(cf / ((1 + discount_rate) ** i) for i, cf in enumerate(cashflows))
+irr_val = irr(cashflows)
+
+st.markdown(
+    f"""
+###  ผลการวิเคราะห์ทางการเงิน (Financial Results – PVsyst-grade)
+
+**เศรษฐศาสตร์ของระบบ (System Economics)**
+- เงินลงทุนเริ่มต้น (CAPEX): **{CAPEX:,.0f} THB**
+- พลังงานปีแรก (Year-1 Energy): **{E_year_1:,.0f} kWh/year**
+- อัตราการใช้ไฟเอง (Self-consumption): **{self_use_ratio*100:.0f} %**
+
+**ตัวชี้วัดทางการเงิน (Financial Indicators)**
+- ระยะเวลาคืนทุนแบบธรรมดา (Simple Payback):  
+  **{simple_payback if simple_payback else '>' + str(project_life)} ปี (years)**
+
+- ระยะเวลาคืนทุนแบบคิดลด (Discounted Payback):  
+  **{discounted_payback if discounted_payback else '>' + str(project_life)} ปี (years)**
+
+- มูลค่าปัจจุบันสุทธิ (NPV) @ {discount_rate*100:.0f}%:  
+  **{npv:,.0f} THB**
+
+- อัตราผลตอบแทนภายใน (IRR):  
+  **{irr_val*100:.1f} %**
+
+**หมายเหตุเชิงวิศวกรรม (Engineering Notes)**
+- คิดค่าการเสื่อมสภาพของแผง PV (PV degradation) = **0.5 %/year**
+- ค่าบำรุงรักษาระบบ (O&M) = **1.5 % ของ CAPEX ต่อปี**
+- ค่าทดแทนอินเวอร์เตอร์ (Inverter replacement) ปีที่ **{inv_replacement_year}**
+- รายได้แยกการใช้ไฟเอง (Self-use) และไฟส่งออก (Export)
+"""
+)
+
+
+def safe_round(value, digits=2):
+    try:
+        if value is None:
+            return "N/A"
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float)) and np.isfinite(value):
+            return round(float(value), digits)
+        return "N/A"
+    except:
+        return "N/A"
+
+
+# =========================================================
+# AI RESULT STORAGE (Production Safe)
+# =========================================================
+
+if "ai_result" not in st.session_state:
+    st.session_state["ai_result"] = None
+
+if "ai_loading" not in st.session_state:
+    st.session_state["ai_loading"] = False
+
+
+if st.button("Generate AI Recommendation", disabled=st.session_state["ai_loading"]):
+
+    # -------------------------------------------------
+    # Validate prerequisites
+    # -------------------------------------------------
+    if not st.session_state.get("run_design", False):
+        st.warning("⚠️ Please run PV system design first.")
+        st.stop()
+
+    panels_df = st.session_state.get("panels_db", pd.DataFrame())
+    inverters_df = st.session_state.get("inverters_db", pd.DataFrame())
+
+    if panels_df.empty or inverters_df.empty:
+        st.warning("⚠️ Equipment database not loaded.")
+        st.stop()
+
+    # -------------------------------------------------
+    # Run AI Engine
+    # -------------------------------------------------
+    st.session_state["ai_loading"] = True
+
+    try:
+        with st.spinner("AI selecting optimal equipment..."):
+
+            ai_result = ai_select_from_database(
+                panels_df=panels_df,
+                inverters_df=inverters_df,
+                dc_capacity=dc_capacity,
+                dc_ac_ratio=dc_ac_ratio,
+                area=area,
+                GEMINI_KEY=GEMINI_KEY,
+                OPENAI_KEY=OPENAI_KEY
+            )
+
+            st.session_state["ai_result"] = ai_result
+
+        st.success("✅ AI recommendation generated successfully.")
+
+    except Exception as e:
+        st.session_state["ai_result"] = "AI execution failed."
+        st.error(f"❌ AI Error: {str(e)}")
+
+    finally:
+        st.session_state["ai_loading"] = False
+
+
+# -------------------------------------------------
+# Display Result (Always Visible After Generation)
+# -------------------------------------------------
+if st.session_state.get("ai_result"):
+    st.markdown("## AI Recommendation Result")
+    st.code(st.session_state["ai_result"])
+
+
+
+
+
+
+st.header(" Export IEEE Engineering Paper")
+
+if st.button(" Generate IEEE Paper", key="ieee_export_btn"):
+
+    buffer = io.BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=40,
+        leftMargin=40,
+        topMargin=40,
+        bottomMargin=40
+    )
+
+    styles = getSampleStyleSheet()
+
+    styles.add(ParagraphStyle(
+        name="IEEE_Title",
+        fontName="TH-B",
+        fontSize=18,
+        alignment=TA_CENTER,
+        spaceAfter=14
+    ))
+
+    styles.add(ParagraphStyle(
+        name="IEEE_Section",
+        fontName="TH-B",
+        fontSize=14,
+        spaceBefore=12,
+        spaceAfter=6
+    ))
+
+    styles.add(ParagraphStyle(
+        name="IEEE_Body",
+        fontName="TH",
+        fontSize=12,
+        leading=16,
+        alignment=TA_JUSTIFY
+    ))
+
+    story = []
+
+    # =====================================================
+    # TITLE
+    # =====================================================
+    story.append(Paragraph(
+        "Design and Optimization of Rooftop Solar PV System with AI-Assisted Component Selection",
+        styles["IEEE_Title"]
+    ))
+
+    story.append(Spacer(1, 8))
+
+    # =====================================================
+    # ABSTRACT
+    # =====================================================
+    story.append(Paragraph("Abstract", styles["IEEE_Section"]))
+
+    story.append(Paragraph(
+        f"""
+This paper presents the engineering design and economic evaluation of a rooftop
+solar photovoltaic (PV) system sized at {dc_capacity:.2f} kWp.
+The system is designed based on peak sun hours ({H_sun:.2f} h/day),
+performance ratio ({PR:.2f}), and rooftop constraints ({area:.1f} m²).
+A deterministic calculation approach is applied for system sizing,
+while a large language model (LLM) is utilized for database-assisted
+component selection. Financial feasibility including IRR and payback
+period is evaluated to determine project viability.
+""",
+        styles["IEEE_Body"]
+    ))
+
+    # =====================================================
+    # I. INTRODUCTION
+    # =====================================================
+    story.append(Paragraph("I. INTRODUCTION", styles["IEEE_Section"]))
+
+    story.append(Paragraph(
+        """
+Rooftop solar photovoltaic systems are increasingly adopted
+for residential and commercial applications.
+Proper engineering design is essential to ensure electrical safety,
+performance optimization, and financial feasibility.
+""",
+        styles["IEEE_Body"]
+    ))
+
+    # =====================================================
+    # II. SYSTEM DESIGN METHODOLOGY
+    # =====================================================
+    story.append(Paragraph("II. SYSTEM DESIGN METHODOLOGY", styles["IEEE_Section"]))
+
+    story.append(Paragraph(
+        f"""
+The required PV capacity is calculated using the daily energy demand
+({E_day:.2f} kWh/day), peak sun hours, and performance ratio.
+The DC/AC ratio is maintained at {dc_ac_ratio:.2f} to ensure inverter
+loading optimization and clipping control.
+""",
+        styles["IEEE_Body"]
+    ))
+
+    # =====================================================
+    # III. ENGINEERING RESULTS
+    # =====================================================
+    story.append(Paragraph("III. ENGINEERING RESULTS", styles["IEEE_Section"]))
+
+    results_table = Table([
+        ["Parameter", "Value"],
+        ["PV Capacity (kWp)", f"{dc_capacity:.2f}"],
+        ["DC/AC Ratio", f"{dc_ac_ratio:.2f}"],
+        ["Panels per String", str(panels_per_string)],
+        ["Number of Strings", str(strings_used)],
+    ], colWidths=[230, 230])
+
+    results_table.setStyle(TableStyle([
+        ("FONT", (0,0), (-1,-1), "TH"),
+        ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+        ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+    ]))
+
+    story.append(results_table)
+
+    # =====================================================
+    # IV. AI-ASSISTED COMPONENT SELECTION
+    # =====================================================
+    story.append(Paragraph("IV. AI-ASSISTED COMPONENT SELECTION", styles["IEEE_Section"]))
+
+    ai_result = st.session_state.get("ai_result", "No AI result available.")
+
+    story.append(Paragraph(
+        ai_result.replace("\n", "<br/>"),
+        styles["IEEE_Body"]
+    ))
+
+    # =====================================================
+    # V. FINANCIAL ANALYSIS
+    # =====================================================
+    story.append(Paragraph("V. FINANCIAL ANALYSIS", styles["IEEE_Section"]))
+
+    story.append(Paragraph(
+        f"""
+The financial evaluation indicates a simple payback period of
+{simple_payback} years and an internal rate of return (IRR)
+of {irr_val*100:.2f}%.
+""",
+        styles["IEEE_Body"]
+    ))
+
+    # =====================================================
+    # VI. CONCLUSION
+    # =====================================================
+    story.append(Paragraph("VI. CONCLUSION", styles["IEEE_Section"]))
+
+    story.append(Paragraph(
+        """
+The designed solar PV system satisfies engineering constraints
+and demonstrates economic feasibility.
+The integration of deterministic calculation with AI-assisted
+database selection enhances engineering workflow efficiency
+while maintaining technical reliability.
+""",
+        styles["IEEE_Body"]
+    ))
+
+    # =====================================================
+    # BUILD
+    # =====================================================
+    doc.build(story)
+
+    st.download_button(
+        "Download PDF",
+        data=buffer.getvalue(),
+        file_name="IEEE_Solar_PV_Paper.pdf",
+        mime="application/pdf",
+        key="download_ieee_btn"
+    )
+
+
 
